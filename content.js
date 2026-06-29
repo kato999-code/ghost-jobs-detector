@@ -58,13 +58,17 @@
   // active LinkedIn job description panel layout.
   // ---------------------------------------------------------------------------
   const SELECTORS = {
-    // The right-hand detail panel containing the full description.
+    // Robust cascade of injection anchors — any one of these structural
+    // containers is sufficient. Ordered from most-specific to broadest fallback.
     descriptionPanel: [
+      ".jobs-description__container",
+      "#job-details",
       ".jobs-description__content",
       ".jobs-description-content",
       ".jobs-box__html-content",
       "div.jobs-description",
       "article.jobs-description",
+      ".job-details-jobs-unified-top-card",
     ],
     jobTitle: [
       ".job-details-jobs-unified-top-card__job-title h1",
@@ -412,22 +416,73 @@
     return String(s).replace(/[&<>"']/g, (c) => map[c]);
   }
 
-  function injectCard(job, score) {
+  // Resolve the best available injection anchor using the full cascade.
+  // Tries every selector across both the panel + text lists, plus broad fallbacks.
+  function findInjectionTarget() {
+    const candidates = [
+      ...SELECTORS.descriptionPanel,
+      ...SELECTORS.descriptionText,
+      ".jobs-search__right-rail",
+      ".jobs-search-two-pane__job-details",
+      ".job-view-layout",
+      "#main-content",
+    ];
+    for (const sel of candidates) {
+      const el = document.querySelector(sel);
+      if (el && el.offsetParent !== null) {
+        return { el, selector: sel };
+      }
+    }
+    return null;
+  }
+
+  // Dedup guard: returns true if a widget already lives inside the target block.
+  function targetHasCard(target) {
+    if (!target) return false;
+    return !!(
+      target.querySelector(`#${CARD_ID}`) ||
+      target.querySelector(`[${PROCESSED_ATTR}]`) ||
+      document.getElementById(CARD_ID)
+    );
+  }
+
+  // Wait for an injection target to appear (SPA renders async).
+  // Resolves with { el, selector } or null after timeout.
+  function waitForInjectionTarget({ timeout = 4000, interval = 150 } = {}) {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const tick = () => {
+        const found = findInjectionTarget();
+        if (found) return resolve(found);
+        if (Date.now() - start >= timeout) return resolve(null);
+        setTimeout(tick, interval);
+      };
+      tick();
+    });
+  }
+
+  function injectCard(job, score, targetOverride) {
     const theme = detectTheme();
     ensureStyles(theme);
 
-    // Remove any prior card so we never double-inject on SPA nav.
+    // Remove any prior card anywhere so we never double-inject on SPA nav.
     document.getElementById(CARD_ID)?.remove();
+    document.querySelectorAll(`[${PROCESSED_ATTR}]`).forEach((n) => n.remove());
 
-    const panel =
-      queryFirst(SELECTORS.descriptionPanel) ||
-      queryFirst(SELECTORS.descriptionText) ||
-      document.querySelector(".jobs-search__right-rail, .jobs-search-two-pane__job-details") ||
-      null;
-
-    if (!panel) {
-      warn("Could not locate job description panel to inject card.");
+    const target = targetOverride || findInjectionTarget();
+    if (!target) {
+      warn(
+        "Target container not found! Tried cascade:",
+        SELECTORS.descriptionPanel,
+        "→ no structural anchor matched this LinkedIn layout."
+      );
       return false;
+    }
+
+    // Gracefully avoid duplicate injection if a widget already stands inside the block.
+    if (targetHasCard(target)) {
+      log("Card already present in target — skipping duplicate injection.", target.selector);
+      return true;
     }
 
     const container = document.createElement("div");
@@ -435,23 +490,25 @@
     container.setAttribute(PROCESSED_ATTR, "true");
     container.innerHTML = buildCard(job, score, theme);
 
-    // Prepend cleanly inside the top of the active job description panel.
-    panel.insertBefore(container, panel.firstChild);
+    // Prepend cleanly inside the top of the resolved container.
+    target.el.insertBefore(container, target.el.firstChild);
 
-    log("✅ Ghost Risk card injected.", { theme, panel, score });
+    log("✅ Ghost Risk card injected into", target.selector, { theme, score });
     return true;
   }
 
-  function showLoading(job) {
+  function showLoading(job, targetOverride) {
     const theme = detectTheme();
     ensureStyles(theme);
     document.getElementById(CARD_ID)?.remove();
+    document.querySelectorAll(`[${PROCESSED_ATTR}].gjd-loading`)?.forEach((n) => n.remove());
 
-    const panel = queryFirst(SELECTORS.descriptionPanel) || queryFirst(SELECTORS.descriptionText);
-    if (!panel) return;
+    const target = targetOverride || findInjectionTarget();
+    if (!target) return; // silently wait; the polling loop will retry.
 
     const container = document.createElement("div");
     container.className = "gjd-root";
+    container.setAttribute(PROCESSED_ATTR, "true");
     container.innerHTML = `
       <section id="${CARD_ID}" class="gjd-card gjd-loading" data-theme="${theme}">
         <div class="gjd-card-header">
@@ -468,7 +525,7 @@
         <div class="gjd-skeleton-row"></div>
       </section>
     `;
-    panel.insertBefore(container, panel.firstChild);
+    target.el.insertBefore(container, target.el.firstChild);
   }
 
   // ---------------------------------------------------------------------------
@@ -487,16 +544,35 @@
     lastJobSignature = signature;
 
     log("🔎 Job view change detected →", job);
-    showLoading(job);
+
+    // Wait (poll) for a valid injection anchor to appear before doing anything.
+    const target = await waitForInjectionTarget({ timeout: 4000, interval: 150 });
+    if (!target) {
+      warn(
+        "Target container not found after 4s polling. Tried cascade:",
+        SELECTORS.descriptionPanel
+      );
+      isInjecting = false;
+      return;
+    }
+
+    // If a card already stands inside the resolved block, bail gracefully.
+    if (targetHasCard(target)) {
+      log("Card already present in", target.selector, "— skipping.");
+      isInjecting = false;
+      return;
+    }
+
+    showLoading(job, target);
 
     try {
       const score = await fetchGhostScore(job);
-      // Ensure the panel hasn't been swapped out during the async wait.
+      // Ensure the view hasn't been swapped out during the async wait.
       if (signature !== lastJobSignature) {
         isInjecting = false;
         return;
       }
-      injectCard(job, score);
+      injectCard(job, score, target);
     } catch (err) {
       warn("Scoring failed:", err);
     } finally {
