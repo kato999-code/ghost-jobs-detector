@@ -104,13 +104,15 @@
   }
 
   function extractJobData() {
+    // Safe optional chaining throughout — a momentarily-blank element fails
+    // silently to "" instead of throwing a hard TypeError that halts the script.
     const titleEl = queryFirst(SELECTORS.jobTitle);
     const companyEl = queryFirst(SELECTORS.company);
     const descEl = queryFirst(SELECTORS.descriptionText);
 
-    const jobTitle = cleanText(titleEl?.innerText || "");
-    const companyName = cleanText(companyEl?.innerText || "");
-    const jobDescription = cleanText(descEl?.innerText || "");
+    const jobTitle = cleanText(titleEl?.textContent || titleEl?.innerText || "");
+    const companyName = cleanText(companyEl?.textContent || companyEl?.innerText || "");
+    const jobDescription = cleanText(descEl?.textContent || descEl?.innerText || "");
 
     const url = location.href;
     const jobIdMatch = url.match(/\/jobs\/(?:view|collections|search)\/?(\d+)/);
@@ -118,13 +120,33 @@
 
     return {
       jobId,
-      jobTitle: jobTitle || "(title not found)",
-      companyName: companyName || "(company not found)",
-      jobDescription: jobDescription || "(description not found)",
+      jobTitle,
+      companyName,
+      jobDescription,
       descriptionLength: jobDescription.length,
       url,
       extractedAt: new Date().toISOString(),
+      ready: jobTitle.length > 0 && companyName.length > 0 && jobDescription.length >= 20,
     };
+  }
+
+  // Poll for fully-rendered job data (LinkedIn renders text containers async).
+  // Checks every 100ms up to 30 retries; resolves with job or null on timeout.
+  function waitForJobData({ interval = 100, maxRetries = 30 } = {}) {
+    return new Promise((resolve) => {
+      let attempts = 0;
+      const tick = () => {
+        const job = extractJobData();
+        if (job.ready) return resolve(job);
+        attempts += 1;
+        if (attempts >= maxRetries) {
+          warn(`Job data not ready after ${maxRetries} retries — using partial data.`, job);
+          return resolve(job);
+        }
+        setTimeout(tick, interval);
+      };
+      tick();
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -535,46 +557,49 @@
     if (!isJobViewUrl()) return;
     if (isInjecting) return;
 
-    const job = extractJobData();
-    const signature = `${job.jobId}|${job.jobTitle}|${job.descriptionLength}`;
-    if (signature === lastJobSignature) return; // already processed this exact view
-    if (job.jobDescription.length < 20) return; // panel not fully rendered yet
+    // Quick early signature check to avoid re-running for the same view.
+    const earlyJob = extractJobData();
+    const earlySig = `${earlyJob.jobId}|${earlyJob.jobTitle}|${earlyJob.descriptionLength}`;
+    if (earlySig === lastJobSignature) return;
 
     isInjecting = true;
-    lastJobSignature = signature;
-
-    log("🔎 Job view change detected →", job);
-
-    // Wait (poll) for a valid injection anchor to appear before doing anything.
-    const target = await waitForInjectionTarget({ timeout: 4000, interval: 150 });
-    if (!target) {
-      warn(
-        "Target container not found after 4s polling. Tried cascade:",
-        SELECTORS.descriptionPanel
-      );
-      isInjecting = false;
-      return;
-    }
-
-    // If a card already stands inside the resolved block, bail gracefully.
-    if (targetHasCard(target)) {
-      log("Card already present in", target.selector, "— skipping.");
-      isInjecting = false;
-      return;
-    }
-
-    showLoading(job, target);
 
     try {
-      const score = await fetchGhostScore(job);
-      // Ensure the view hasn't been swapped out during the async wait.
-      if (signature !== lastJobSignature) {
-        isInjecting = false;
+      // 1) Wait for job text containers to gracefully appear (poll every 100ms, ≤30 retries).
+      const job = await waitForJobData({ interval: 100, maxRetries: 30 });
+      const signature = `${job.jobId}|${job.jobTitle}|${job.descriptionLength}`;
+      if (signature === lastJobSignature) return; // someone else processed it
+      lastJobSignature = signature;
+
+      log("🔎 Job view change detected →", job);
+
+      // 2) Wait for a valid injection anchor to appear.
+      const target = await waitForInjectionTarget({ timeout: 4000, interval: 150 });
+      if (!target) {
+        warn(
+          "Target container not found after 4s polling. Tried cascade:",
+          SELECTORS.descriptionPanel
+        );
         return;
       }
+
+      // 3) Dedup: bail if a card already stands inside the resolved block.
+      if (targetHasCard(target)) {
+        log("Card already present in", target.selector, "— skipping.");
+        return;
+      }
+
+      // 4) Show loading skeleton while the mock backend "thinks".
+      showLoading(job, target);
+
+      // 5) Run the mock scoring algorithm.
+      const score = await fetchGhostScore(job);
+      if (signature !== lastJobSignature) return; // view swapped out mid-flight
+
+      // 6) Inject the UI card widget element.
       injectCard(job, score, target);
     } catch (err) {
-      warn("Scoring failed:", err);
+      warn("handleJobViewChange error:", err);
     } finally {
       isInjecting = false;
     }
