@@ -1,0 +1,19 @@
+{
+  "name": "ghost-jobs-detector",
+  "version": "0.1.0",
+  "description": "Manifest V3 Chrome Extension — visual sandbox that detects ghost job listings on LinkedIn using a signature scoring formula.",
+  "private": true,
+  "author": "Casey",
+  "license": "MIT",
+  "scripts": {
+    "icons": "node scripts/generate-icons.js"
+  },
+  "keywords": [
+    "chrome-extension",
+    "manifest-v3",
+    "linkedin",
+    "ghost-jobs",
+    "job-board",
+    "sandbox"
+  ]
+}

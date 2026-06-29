@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Ghost Jobs Detector",
+  "version": "0.1.0",
+  "description": "Visual sandbox extension that detects ghost job listings on LinkedIn using a signature scoring formula (Text DNA, Cross-Platform Sync, Salary Transparency).",
+  "author": "Casey",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Ghost Jobs Detector",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "permissions": [],
+  "host_permissions": [
+    "https://*.linkedin.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.linkedin.com/jobs/*",
+        "https://linkedin.com/jobs/*"
+      ],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/*.png"],
+      "matches": ["https://*.linkedin.com/*"]
+    }
+  ]
+}
