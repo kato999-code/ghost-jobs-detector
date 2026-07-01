@@ -1,12 +1,22 @@
 /*
- * Ghost Jobs Detector — content.js
- * Manifest V3 content script for LinkedIn job pages (/jobs/view/*, /jobs/collections/*, /jobs/search/*)
+ * Ghost Jobs Detector — content.js (v0.2.0 — multi-platform)
+ * Manifest V3 content script for universal job-board ghost detection.
  *
- * Responsibilities:
- *  1. Detect navigation to job detail views (LinkedIn is a SPA → patch history methods + observe DOM).
- *  2. Track clicks on job listings and extract Company Name, Job Title, Job Description text.
- *  3. Call an internal async MOCK backend (500ms) that returns the signature scoring payload.
- *  4. Inject a clean, modern, theme-aware card widget at the top of the job description panel.
+ * Supported platforms (via unified platform router):
+ *   - LinkedIn          (linkedin.com/jobs/*)
+ *   - Indeed            (indeed.com)
+ *   - ZipRecruiter      (ziprecruiter.com/jobs*)
+ *   - Glassdoor         (glassdoor.com)
+ *   - JobStreet (SG)    (jobstreet.com.sg)
+ *   - MyCareersFuture   (mycareersfuture.gov.sg)
+ *
+ * Architecture:
+ *   1. Platform router reads window.location.hostname → resolves a SITE_CONFIG.
+ *   2. Each config holds site-specific selector dicts + URL matchers.
+ *   3. Standardized output pipeline: every platform yields { jobTitle, companyName,
+ *      descriptionText } regardless of DOM structure.
+ *   4. UI injector prepends the theme-aware Ghost Risk card into the active
+ *      platform's description container, with polling + dedup + optional chaining.
  *
  * This is a VISUAL SANDBOX: all scoring data is mocked. No real backend is contacted.
  */
@@ -23,15 +33,287 @@
   const PROCESSED_ATTR = "data-gjd-processed";
   let lastJobSignature = "";
   let isInjecting = false;
+  let currentPlatform = null;
 
   const log = (...args) => console.log(LOG_PREFIX, LOG_STYLE, ...args);
   const warn = (...args) => console.warn(LOG_PREFIX, LOG_STYLE, ...args);
 
   // ---------------------------------------------------------------------------
-  // Theme detection — match LinkedIn's native dark / light theme
+  // PLATFORM CONFIGURATIONS — site-specific selector dictionaries
+  // Each config: { id, name, hostMatch, urlMatch, selectors }
+  // selectors: { descriptionPanel[], jobTitle[], company[], descriptionText[], jobCardRow[] }
+  // ---------------------------------------------------------------------------
+  const PLATFORM_CONFIGS = {
+    linkedin: {
+      id: "linkedin",
+      name: "LinkedIn",
+      hostMatch: /(^|\.)linkedin\.com$/,
+      urlMatch: /linkedin\.com\/jobs\/(view|collections|search)/,
+      selectors: {
+        descriptionPanel: [
+          ".jobs-description__container",
+          "#job-details",
+          ".jobs-description__content",
+          ".jobs-description-content",
+          ".jobs-box__html-content",
+          "div.jobs-description",
+          "article.jobs-description",
+          ".job-details-jobs-unified-top-card",
+        ],
+        jobTitle: [
+          ".job-details-jobs-unified-top-card__job-title h1",
+          ".job-details-jobs-unified-top-card__job-title",
+          ".t-24.t-bold.inline",
+          "h1.topcard__title",
+          "h1.job-details-jobs-unified-top-card__job-title",
+        ],
+        company: [
+          ".job-details-jobs-unified-top-card__company-name a",
+          ".job-details-jobs-unified-top-card__company-name",
+          ".topcard__org-name-link",
+          ".job-details-people-who-applied__company-name",
+        ],
+        descriptionText: [
+          ".jobs-description__content .jobs-description__content",
+          ".jobs-description__content",
+          ".jobs-box__html-content",
+          ".jobs-description-content",
+        ],
+        jobCardRow: [
+          ".jobs-search-results__list-item",
+          ".job-card-container",
+          ".job-card-job-posting-card-wrapper",
+          "[data-job-id]",
+        ],
+      },
+    },
+
+    indeed: {
+      id: "indeed",
+      name: "Indeed",
+      hostMatch: /(^|\.)indeed\.com$/,
+      urlMatch: /indeed\.com\/(viewjob|jobs|companies)/,
+      selectors: {
+        descriptionPanel: [
+          "#jobDescriptionText",
+          ".jobsearch-JobComponent-description",
+          "#jobBody",
+          "#rawjob-description",
+          ".jobsearch-ViewJobLayout-jobDisplay",
+        ],
+        jobTitle: [
+          ".jobsearch-JobInfoHeader-title",
+          "h1.jobsearch-JobInfoHeader-title",
+          ".icl-JobResultJobTitle",
+          "h1.jobtitle",
+          "h3.jobsearch-JobInfoHeader-title",
+        ],
+        company: [
+          ".jobsearch-CompanyReviewContainer + div a",
+          ".jobsearch-InlineCompanyRatingLink div",
+          ".jobsearch-CompanyInfoContainer a",
+          "[data-company-name='true']",
+          ".company",
+        ],
+        descriptionText: [
+          "#jobDescriptionText",
+          ".jobsearch-JobComponent-description",
+          "#jobBody",
+          "#rawjob-description",
+        ],
+        jobCardRow: [
+          ".result",
+          ".jobsearch-SerpJobCard",
+          ".cardOutline",
+          "[data-jk]",
+          "a.tapItem",
+        ],
+      },
+    },
+
+    ziprecruiter: {
+      id: "ziprecruiter",
+      name: "ZipRecruiter",
+      hostMatch: /(^|\.)ziprecruiter\.com$/,
+      urlMatch: /ziprecruiter\.com\/(jobs|c\/)/,
+      selectors: {
+        descriptionPanel: [
+          "[data-testid='job-description-section']",
+          ".job_description_content",
+          "#job-description",
+          ".job_details_section",
+          ".mop-body",
+        ],
+        jobTitle: [
+          "h1.job_title",
+          "[data-testid='job-title']",
+          ".job-title",
+          "h1.t_job_title",
+        ],
+        company: [
+          ".company_name a",
+          "[data-testid='company-name']",
+          ".company-name",
+          ".employer_name",
+        ],
+        descriptionText: [
+          "[data-testid='job-description-section']",
+          ".job_description_content",
+          "#job-description",
+          ".job_details_section",
+        ],
+        jobCardRow: [
+          ".job_result",
+          "[data-testid='job-list-item']",
+          ".job-listing",
+          "article.job",
+        ],
+      },
+    },
+
+    glassdoor: {
+      id: "glassdoor",
+      name: "Glassdoor",
+      hostMatch: /(^|\.)glassdoor\.com$/,
+      urlMatch: /glassdoor\.com\/(job-listing|job)/,
+      selectors: {
+        descriptionPanel: [
+          "[data-test='jobDescriptionContainer']",
+          ".jobDescriptionContent",
+          "#JobDescriptionContainer",
+          ".jobDesc",
+          "#jobDescription",
+        ],
+        jobTitle: [
+          "[data-test='job-title']",
+          ".job-title",
+          "h1.jobTitle",
+          "h1",
+        ],
+        company: [
+          "[data-test='employer-name']",
+          ".employerName",
+          ".job-header .employer-name",
+        ],
+        descriptionText: [
+          "[data-test='jobDescriptionContainer']",
+          ".jobDescriptionContent",
+          "#JobDescriptionContainer",
+          ".jobDesc",
+        ],
+        jobCardRow: [
+          "[data-test='job-link']",
+          ".react-job-listing",
+          ".jobCard",
+          "li.jl",
+        ],
+      },
+    },
+
+    jobstreet: {
+      id: "jobstreet",
+      name: "JobStreet (SG)",
+      hostMatch: /(^|\.)jobstreet\.com\.sg$/,
+      urlMatch: /jobstreet\.com\.sg\/(job|jobs|employer)/,
+      selectors: {
+        descriptionPanel: [
+          "[data-automation='jobDescription']",
+          "#job-description",
+          ".job-description",
+          "#jobAdDetails",
+          "div[data-automation='jobAdDetails']",
+        ],
+        jobTitle: [
+          "[data-automation='job-detail-title']",
+          "h1.job-title",
+          "h1[data-automation='jobTitle']",
+          "h1",
+        ],
+        company: [
+          "[data-automation='advertiser-name']",
+          ".company-name",
+          "span[data-automation='companyName']",
+        ],
+        descriptionText: [
+          "[data-automation='jobDescription']",
+          "#job-description",
+          ".job-description",
+          "#jobAdDetails",
+        ],
+        jobCardRow: [
+          "[data-automation='jobCard']",
+          "article.job-card",
+          ".job-card",
+          "[data-card-type='up']",
+        ],
+      },
+    },
+
+    mycareersfuture: {
+      id: "mycareersfuture",
+      name: "MyCareersFuture (SG)",
+      hostMatch: /(^|\.)mycareersfuture\.gov\.sg$/,
+      urlMatch: /mycareersfuture\.gov\.sg\/job\//,
+      selectors: {
+        descriptionPanel: [
+          "#job_description",
+          "#job-description",
+          ".job-description",
+          "[data-testid='job-description']",
+          "#main-content",
+        ],
+        jobTitle: [
+          "h1#job_title",
+          "h1[data-testid='job-title']",
+          ".job-title",
+          "h1",
+        ],
+        company: [
+          "#company_name",
+          "[data-testid='company-name']",
+          ".company-name",
+          "p#company_name",
+        ],
+        descriptionText: [
+          "#job_description",
+          "#job-description",
+          ".job-description",
+          "[data-testid='job-description']",
+        ],
+        jobCardRow: [
+          "[data-testid='job-card']",
+          ".job-card",
+          "div.SearchResultsPage_job_card__",
+          "a.job-card",
+        ],
+      },
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // PLATFORM ROUTER — resolves the active site config from window.location
+  // ---------------------------------------------------------------------------
+  function detectPlatform() {
+    const host = window.location.hostname;
+    const href = window.location.href;
+    for (const key of Object.keys(PLATFORM_CONFIGS)) {
+      const cfg = PLATFORM_CONFIGS[key];
+      if (cfg.hostMatch.test(host) && (!cfg.urlMatch || cfg.urlMatch.test(href))) {
+        return cfg;
+      }
+    }
+    // Fallback: host match only (let the URL gate be handled elsewhere)
+    for (const key of Object.keys(PLATFORM_CONFIGS)) {
+      const cfg = PLATFORM_CONFIGS[key];
+      if (cfg.hostMatch.test(host)) return cfg;
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Theme detection — match native dark / light theme of any platform
   // ---------------------------------------------------------------------------
   function detectTheme() {
-    // LinkedIn sets theme via <html data-theme="..."> or body background.
     const htmlTheme = document.documentElement.getAttribute("data-theme") || "";
     if (htmlTheme.toLowerCase().includes("dark")) return "dark";
 
@@ -39,8 +321,16 @@
     if (explicit === "dark") return "dark";
     if (explicit === "light") return "light";
 
-    // Fallback: sample computed background of the app root.
-    const probe = document.querySelector(".application-outlet, #extended-nav, body");
+    // Also check <meta name="color-scheme">
+    const meta = document.querySelector('meta[name="color-scheme"]');
+    if (meta) {
+      const c = meta.getAttribute("content") || "";
+      if (c.includes("dark")) return "dark";
+      if (c.includes("light")) return "light";
+    }
+
+    // Fallback: sample computed background of the app root / body.
+    const probe = document.querySelector("body, #app, #root, [class*='app'], main");
     if (probe) {
       const bg = window.getComputedStyle(probe).backgroundColor || "";
       const m = bg.match(/\d+/g);
@@ -54,47 +344,19 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Data extraction — reads Company Name, Job Title, Job Description from the
-  // active LinkedIn job description panel layout.
+  // DOM helpers (with safe optional chaining — never throw on null)
   // ---------------------------------------------------------------------------
-  const SELECTORS = {
-    // Robust cascade of injection anchors — any one of these structural
-    // containers is sufficient. Ordered from most-specific to broadest fallback.
-    descriptionPanel: [
-      ".jobs-description__container",
-      "#job-details",
-      ".jobs-description__content",
-      ".jobs-description-content",
-      ".jobs-box__html-content",
-      "div.jobs-description",
-      "article.jobs-description",
-      ".job-details-jobs-unified-top-card",
-    ],
-    jobTitle: [
-      ".job-details-jobs-unified-top-card__job-title h1",
-      ".job-details-jobs-unified-top-card__job-title",
-      ".t-24.t-bold.inline",
-      "h1.topcard__title",
-      "h1.job-details-jobs-unified-top-card__job-title",
-    ],
-    company: [
-      ".job-details-jobs-unified-top-card__company-name a",
-      ".job-details-jobs-unified-top-card__company-name",
-      ".topcard__org-name-link",
-      ".job-details-people-who-applied__company-name",
-    ],
-    descriptionText: [
-      ".jobs-description__content .jobs-description__content",
-      ".jobs-description__content",
-      ".jobs-box__html-content",
-      ".jobs-description-content",
-    ],
-  };
-
   function queryFirst(selectorList, root = document) {
+    if (!selectorList || !selectorList.length) return null;
     for (const sel of selectorList) {
-      const el = root.querySelector(sel);
-      if (el && el.offsetParent !== null) return el;
+      try {
+        const el = root.querySelector(sel);
+        if (el && el.offsetParent !== null) return el;
+        // Some platforms use position:fixed panels (offsetParent null but visible)
+        if (el && el.getClientRects?.().length > 0) return el;
+      } catch {
+        /* invalid selector on this page — skip silently */
+      }
     }
     return null;
   }
@@ -103,44 +365,52 @@
     return (text || "").replace(/\s+/g, " ").trim();
   }
 
-  function extractJobData() {
-    // Safe optional chaining throughout — a momentarily-blank element fails
-    // silently to "" instead of throwing a hard TypeError that halts the script.
-    const titleEl = queryFirst(SELECTORS.jobTitle);
-    const companyEl = queryFirst(SELECTORS.company);
-    const descEl = queryFirst(SELECTORS.descriptionText);
+  // ---------------------------------------------------------------------------
+  // STANDARDIZED EXTRACTION — uniform { jobTitle, companyName, descriptionText }
+  // Uses the active platform's selector dictionary.
+  // ---------------------------------------------------------------------------
+  function extractJobData(platform) {
+    if (!platform) return null;
+    const s = platform.selectors;
+
+    const titleEl = queryFirst(s.jobTitle);
+    const companyEl = queryFirst(s.company);
+    const descEl = queryFirst(s.descriptionText);
 
     const jobTitle = cleanText(titleEl?.textContent || titleEl?.innerText || "");
     const companyName = cleanText(companyEl?.textContent || companyEl?.innerText || "");
-    const jobDescription = cleanText(descEl?.textContent || descEl?.innerText || "");
+    const descriptionText = cleanText(descEl?.textContent || descEl?.innerText || "");
 
     const url = location.href;
-    const jobIdMatch = url.match(/\/jobs\/(?:view|collections|search)\/?(\d+)/);
+    const jobIdMatch = url.match(/\/(?:viewjob|jobs?|job|c)\/?([a-zA-Z0-9_-]+)/);
     const jobId = jobIdMatch ? jobIdMatch[1] : url;
 
     return {
+      platform: platform.id,
+      platformName: platform.name,
       jobId,
       jobTitle,
       companyName,
-      jobDescription,
-      descriptionLength: jobDescription.length,
+      descriptionText,
+      descriptionLength: descriptionText.length,
       url,
       extractedAt: new Date().toISOString(),
-      ready: jobTitle.length > 0 && companyName.length > 0 && jobDescription.length >= 20,
+      ready: jobTitle.length > 0 && companyName.length > 0 && descriptionText.length >= 20,
     };
   }
 
-  // Poll for fully-rendered job data (LinkedIn renders text containers async).
-  // Checks every 100ms up to 30 retries; resolves with job or null on timeout.
-  function waitForJobData({ interval = 100, maxRetries = 30 } = {}) {
+  // Poll for fully-rendered job data (all platforms render text containers async).
+  // Checks every 100ms up to 30 retries; resolves with job or partial on timeout.
+  function waitForJobData(platform, { interval = 100, maxRetries = 30 } = {}) {
     return new Promise((resolve) => {
       let attempts = 0;
       const tick = () => {
-        const job = extractJobData();
+        const job = extractJobData(platform);
+        if (!job) return resolve(null);
         if (job.ready) return resolve(job);
         attempts += 1;
         if (attempts >= maxRetries) {
-          warn(`Job data not ready after ${maxRetries} retries — using partial data.`, job);
+          warn(`[${platform.name}] Job data not ready after ${maxRetries} retries — using partial data.`, job);
           return resolve(job);
         }
         setTimeout(tick, interval);
@@ -150,41 +420,38 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Click tracking on job listings
+  // Click tracking on job listings (cross-platform)
   // ---------------------------------------------------------------------------
-  function attachClickTracking() {
+  function attachClickTracking(platform) {
+    if (!platform) return;
+    const rowSelectors = platform.selectors.jobCardRow || [];
+    if (!rowSelectors.length) return;
+
     document.addEventListener(
       "click",
       (e) => {
-        // Walk up to find a job-listing row.
-        const row = e.target.closest(
-          [
-            ".jobs-search-results__list-item",
-            ".job-card-container",
-            ".job-card-job-posting-card-wrapper",
-            "li.jobs-search-results__list-item",
-            "[data-job-id]",
-          ].join(",")
-        );
+        const row = e.target.closest(rowSelectors.join(","));
         if (!row) return;
 
         const jobId =
           row.getAttribute("data-job-id") ||
+          row.getAttribute("data-jk") ||
+          row.getAttribute("data-id") ||
           row
-            .querySelector("a[href*='/jobs/view/']")
+            .querySelector("a[href*='/job'], a[href*='/viewjob'], a[href*='/jobs/view/']")
             ?.getAttribute("href")
-            ?.match(/\/jobs\/view\/(\d+)/)?.[1] ||
+            ?.match(/\/(?:job|viewjob|jobs\/view)\/?([a-zA-Z0-9_-]+)/)?.[1] ||
           "unknown";
 
-        log("🖱️  Job listing clicked →", { jobId, preview: cleanText(row.innerText).slice(0, 80) });
+        log(`🖱️  [${platform.name}] Job listing clicked →`, { jobId, preview: cleanText(row.innerText).slice(0, 80) });
 
-        // LinkedIn swaps the detail panel via SPA; re-evaluate shortly after.
+        // Most platforms swap the detail panel via SPA; re-evaluate shortly after.
         setTimeout(() => handleJobViewChange(), 450);
         setTimeout(() => handleJobViewChange(), 1000);
       },
       true
     );
-    log("Click tracking attached to job listings.");
+    log(`Click tracking attached to ${platform.name} job listings.`);
   }
 
   // ---------------------------------------------------------------------------
@@ -208,13 +475,15 @@
     log("History methods patched for SPA navigation.");
   }
 
-  function isJobViewUrl(url = location.href) {
-    return /linkedin\.com\/jobs\/(view|collections|search)/.test(url);
+  function isJobViewUrl(platform) {
+    if (!platform) return false;
+    if (!platform.urlMatch) return true; // if no URL gate, treat host match as sufficient
+    return platform.urlMatch.test(location.href);
   }
 
   // ---------------------------------------------------------------------------
   // MOCK backend — simulates an async API call (500ms) returning the signature
-  // scoring formula payload. Replaces the future real backend for the sandbox.
+  // scoring formula payload. Uniform across all platforms.
   // ---------------------------------------------------------------------------
   function hashString(str) {
     let h = 2166136261;
@@ -226,7 +495,6 @@
   }
 
   function deterministicPseudo(seed) {
-    // Mulberry32 PRNG seeded by job signature hash → stable mock scores.
     const t = (seed += 0x6d2b79f5);
     let r = Math.imul(t ^ (t >>> 15), 1 | t);
     r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
@@ -235,33 +503,26 @@
 
   /**
    * Simulates a backend API call to the Ghost Jobs scoring service.
-   * @param {{jobTitle:string, companyName:string, jobDescription:string}} job
-   * @returns {Promise<object>} structured scoring payload
+   * Uniform across all platforms. @param {object} job @returns {Promise<object>}
    */
   async function fetchGhostScore(job) {
     const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     await delay(500); // simulated network latency
 
-    const seed = hashString(`${job.companyName}|${job.jobTitle}|${job.jobDescription.slice(0, 200)}`);
+    const seed = hashString(`${job.platform}|${job.companyName}|${job.jobTitle}|${job.descriptionText.slice(0, 200)}`);
 
-    // --- Text DNA Match Risk (0–100) ---
-    // How closely the JD's lexical fingerprint matches known ghost-post templates.
-    const textDnaMatchRisk = Math.round(15 + deterministicPseudo(seed) * 80); // 15–95
+    const textDnaMatchRisk = Math.round(15 + deterministicPseudo(seed) * 80);
 
-    // --- Cross-Platform Desynchronization Status ---
-    // Is the posting's age/metadata inconsistent across platforms?
     const desync = deterministicPseudo(seed + 7);
     const crossPlatformDesyncStatus = {
       status: desync > 0.66 ? "DESYNCED" : desync > 0.33 ? "PARTIAL_SYNC" : "SYNCED",
       confidence: Math.round(40 + deterministicPseudo(seed + 11) * 60),
       daysStale: Math.floor(deterministicPseudo(seed + 13) * 120),
-      platformsChecked: ["LinkedIn", "Company Careers", "Indeed", "Glassdoor"],
+      platformsChecked: ["LinkedIn", "Indeed", "Glassdoor", "Company Careers", "ZipRecruiter"],
     };
 
-    // --- Legal Salary Transparency Compliance ---
-    // Whether the posting satisfies regional salary-disclosure mandates.
     const salaryScore = deterministicPseudo(seed + 19);
-    const salaryPresent = /salary|compensation|\$\d|k\/yr|per year/i.test(job.jobDescription);
+    const salaryPresent = /salary|compensation|\$\d|k\/yr|per year|monthly|annum/i.test(job.descriptionText);
     const legalSalaryTransparency = {
       compliant: salaryPresent ? salaryScore > 0.3 : salaryScore > 0.75,
       disclosurePresent: salaryPresent,
@@ -269,18 +530,11 @@
       penaltyRiskLevel: salaryPresent ? (salaryScore > 0.7 ? "LOW" : "MEDIUM") : "HIGH",
     };
 
-    // --- Aggregated Ghost Risk % ---
-    // Weighted blend of the three signature components.
     const ghostRisk = Math.round(
       Math.min(
         99,
         textDnaMatchRisk * 0.5 +
-          (crossPlatformDesyncStatus.status === "DESYNCED"
-            ? 85
-            : crossPlatformDesyncStatus.status === "PARTIAL_SYNC"
-            ? 45
-            : 12) *
-            0.3 +
+          (crossPlatformDesyncStatus.status === "DESYNCED" ? 85 : crossPlatformDesyncStatus.status === "PARTIAL_SYNC" ? 45 : 12) * 0.3 +
           (legalSalaryTransparency.compliant ? 10 : 70) * 0.2
       )
     );
@@ -288,32 +542,33 @@
     return {
       meta: {
         jobId: job.jobId,
+        platform: job.platform,
+        platformName: job.platformName,
         analyzedAt: new Date().toISOString(),
-        engineVersion: "0.1.0-mock",
+        engineVersion: "0.2.0-mock",
         latencyMs: 500,
         mock: true,
       },
       signatureFormula: {
-        textDnaMatchRisk, // 0–100
-        crossPlatformDesynchronizationStatus: crossPlatformDesyncStatus, // object
-        legalSalaryTransparency, // object
+        textDnaMatchRisk,
+        crossPlatformDesynchronizationStatus: crossPlatformDesyncStatus,
+        legalSalaryTransparency,
       },
-      ghostRisk, // 0–100 aggregated
-      verdict:
-        ghostRisk >= 70 ? "HIGH_RISK_GHOST" : ghostRisk >= 40 ? "SUSPICIOUS" : "LIKELY_REAL",
+      ghostRisk,
+      verdict: ghostRisk >= 70 ? "HIGH_RISK_GHOST" : ghostRisk >= 40 ? "SUSPICIOUS" : "LIKELY_REAL",
     };
   }
 
   // ---------------------------------------------------------------------------
-  // UI Injection — clean, modern, theme-aware card widget
+  // UI Injection — clean, modern, theme-aware card widget (cross-platform)
   // ---------------------------------------------------------------------------
-  function ensureStyles(theme) {
+  function ensureStyles() {
     if (document.getElementById("gjd-styles")) return;
     const link = document.createElement("link");
     link.id = "gjd-styles";
     link.rel = "stylesheet";
     link.href = chrome.runtime.getURL("styles.css");
-    document.head.appendChild(link);
+    document.head?.appendChild(link);
   }
 
   function riskColor(risk) {
@@ -328,16 +583,13 @@
     const circ = 2 * Math.PI * r;
     const offset = circ * (1 - risk / 100);
     const trackColor = theme === "dark" ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)";
-
     return `
       <div class="gjd-gauge-wrap">
         <svg class="gjd-gauge" viewBox="0 0 120 120" width="120" height="120">
           <circle cx="60" cy="60" r="${r}" fill="none" stroke="${trackColor}" stroke-width="10"/>
           <circle cx="60" cy="60" r="${r}" fill="none" stroke="${stroke}" stroke-width="10"
-            stroke-linecap="round"
-            stroke-dasharray="${circ.toFixed(2)}"
-            stroke-dashoffset="${offset.toFixed(2)}"
-            transform="rotate(-90 60 60)"
+            stroke-linecap="round" stroke-dasharray="${circ.toFixed(2)}"
+            stroke-dashoffset="${offset.toFixed(2)}" transform="rotate(-90 60 60)"
             style="transition:stroke-dashoffset 700ms cubic-bezier(0.22,1,0.36,1)"/>
           <text x="60" y="56" text-anchor="middle" class="gjd-gauge-pct" fill="${stroke}">${risk}%</text>
           <text x="60" y="76" text-anchor="middle" class="gjd-gauge-sub" fill="currentColor">Ghost Risk</text>
@@ -366,21 +618,19 @@
     const { stroke, bg, label } = riskColor(score.ghostRisk);
     const desync = score.signatureFormula.crossPlatformDesynchronizationStatus;
     const salary = score.signatureFormula.legalSalaryTransparency;
-    const desyncPct =
-      desync.status === "DESYNCED" ? 90 : desync.status === "PARTIAL_SYNC" ? 50 : 15;
+    const desyncPct = desync.status === "DESYNCED" ? 90 : desync.status === "PARTIAL_SYNC" ? 50 : 15;
     const salaryPct = salary.compliant ? 25 : 80;
-
     const desyncAccent = desync.status === "DESYNCED" ? "#ef4444" : desync.status === "PARTIAL_SYNC" ? "#f59e0b" : "#10b981";
     const salaryAccent = salary.compliant ? "#10b981" : "#ef4444";
 
     return `
-      <section id="${CARD_ID}" class="gjd-card" data-theme="${theme}">
+      <section id="${CARD_ID}" class="gjd-card" data-theme="${theme}" data-platform="${job.platform}">
         <header class="gjd-card-header">
           <div class="gjd-brand">
             <span class="gjd-logo">👻</span>
             <div>
               <div class="gjd-brand-title">Ghost Jobs Detector</div>
-              <div class="gjd-brand-sub">Signature Formula Analysis ${score.meta.mock ? "· Mock Engine" : ""}</div>
+              <div class="gjd-brand-sub">${job.platformName} · Signature Formula ${score.meta.mock ? "· Mock Engine" : ""}</div>
             </div>
           </div>
           <span class="gjd-verdict" style="background:${bg};color:${stroke};border-color:${stroke}">${label}</span>
@@ -391,29 +641,10 @@
             ${buildGauge(score.ghostRisk, theme)}
             <div class="gjd-gauge-label" style="color:${stroke}">${label}</div>
           </div>
-
           <div class="gjd-metrics-col">
-            ${buildMetricRow({
-              name: "Text DNA Match Risk",
-              value: `${score.signatureFormula.textDnaMatchRisk}%`,
-              barPct: score.signatureFormula.textDnaMatchRisk,
-              detail: "Lexical fingerprint vs. known ghost-post templates",
-              accent: riskColor(score.signatureFormula.textDnaMatchRisk).stroke,
-            })}
-            ${buildMetricRow({
-              name: "Cross-Platform Desync Status",
-              value: `${desync.status} · ${desyncPct}%`,
-              barPct: desyncPct,
-              detail: `${desync.platformsChecked.length} platforms checked · ${desync.daysStale}d stale · ${desync.confidence}% confidence`,
-              accent: desyncAccent,
-            })}
-            ${buildMetricRow({
-              name: "Salary Transparency Compliance",
-              value: `${salary.compliant ? "Compliant" : "Non-Compliant"} · ${salaryPct}%`,
-              barPct: salaryPct,
-              detail: `${salary.jurisdiction} · disclosure ${salary.disclosurePresent ? "present" : "absent"} · penalty risk: ${salary.penaltyRiskLevel}`,
-              accent: salaryAccent,
-            })}
+            ${buildMetricRow({ name: "Text DNA Match Risk", value: `${score.signatureFormula.textDnaMatchRisk}%`, barPct: score.signatureFormula.textDnaMatchRisk, detail: "Lexical fingerprint vs. known ghost-post templates", accent: riskColor(score.signatureFormula.textDnaMatchRisk).stroke })}
+            ${buildMetricRow({ name: "Cross-Platform Desync Status", value: `${desync.status} · ${desyncPct}%`, barPct: desyncPct, detail: `${desync.platformsChecked.length} platforms checked · ${desync.daysStale}d stale · ${desync.confidence}% confidence`, accent: desyncAccent })}
+            ${buildMetricRow({ name: "Salary Transparency Compliance", value: `${salary.compliant ? "Compliant" : "Non-Compliant"} · ${salaryPct}%`, barPct: salaryPct, detail: `${salary.jurisdiction} · disclosure ${salary.disclosurePresent ? "present" : "absent"} · penalty risk: ${salary.penaltyRiskLevel}`, accent: salaryAccent })}
           </div>
         </div>
 
@@ -421,14 +652,13 @@
           <span class="gjd-footer-job" title="${escapeHtml(job.companyName + " — " + job.jobTitle)}">
             ${escapeHtml(job.companyName)} · ${escapeHtml(job.jobTitle)}
           </span>
-          <span class="gjd-footer-meta">v${score.meta.engineVersion} · analyzed ${new Date(score.meta.analyzedAt).toLocaleTimeString()}</span>
+          <span class="gjd-footer-meta">v${score.meta.engineVersion} · ${new Date(score.meta.analyzedAt).toLocaleTimeString()}</span>
         </footer>
       </section>
     `;
   }
 
   function escapeHtml(s) {
-    // Built from char codes to avoid literal HTML entities being decoded by formatters.
     const amp = "&#" + 38 + ";";
     const lt = "&#" + 60 + ";";
     const gt = "&#" + 62 + ";";
@@ -438,27 +668,26 @@
     return String(s).replace(/[&<>"']/g, (c) => map[c]);
   }
 
-  // Resolve the best available injection anchor using the full cascade.
-  // Tries every selector across both the panel + text lists, plus broad fallbacks.
-  function findInjectionTarget() {
+  // Resolve the best available injection anchor for the active platform.
+  function findInjectionTarget(platform) {
+    if (!platform) return null;
     const candidates = [
-      ...SELECTORS.descriptionPanel,
-      ...SELECTORS.descriptionText,
-      ".jobs-search__right-rail",
-      ".jobs-search-two-pane__job-details",
-      ".job-view-layout",
-      "#main-content",
+      ...platform.selectors.descriptionPanel,
+      ...platform.selectors.descriptionText,
     ];
     for (const sel of candidates) {
-      const el = document.querySelector(sel);
-      if (el && el.offsetParent !== null) {
-        return { el, selector: sel };
+      try {
+        const el = document.querySelector(sel);
+        if (el && (el.offsetParent !== null || el.getClientRects?.().length > 0)) {
+          return { el, selector: sel };
+        }
+      } catch {
+        /* skip invalid selector */
       }
     }
     return null;
   }
 
-  // Dedup guard: returns true if a widget already lives inside the target block.
   function targetHasCard(target) {
     if (!target) return false;
     return !!(
@@ -468,13 +697,11 @@
     );
   }
 
-  // Wait for an injection target to appear (SPA renders async).
-  // Resolves with { el, selector } or null after timeout.
-  function waitForInjectionTarget({ timeout = 4000, interval = 150 } = {}) {
+  function waitForInjectionTarget(platform, { timeout = 4000, interval = 150 } = {}) {
     return new Promise((resolve) => {
       const start = Date.now();
       const tick = () => {
-        const found = findInjectionTarget();
+        const found = findInjectionTarget(platform);
         if (found) return resolve(found);
         if (Date.now() - start >= timeout) return resolve(null);
         setTimeout(tick, interval);
@@ -485,25 +712,19 @@
 
   function injectCard(job, score, targetOverride) {
     const theme = detectTheme();
-    ensureStyles(theme);
+    ensureStyles();
 
-    // Remove any prior card anywhere so we never double-inject on SPA nav.
     document.getElementById(CARD_ID)?.remove();
     document.querySelectorAll(`[${PROCESSED_ATTR}]`).forEach((n) => n.remove());
 
-    const target = targetOverride || findInjectionTarget();
+    const target = targetOverride || findInjectionTarget(currentPlatform);
     if (!target) {
-      warn(
-        "Target container not found! Tried cascade:",
-        SELECTORS.descriptionPanel,
-        "→ no structural anchor matched this LinkedIn layout."
-      );
+      warn(`[${job.platformName}] Target container not found! Tried cascade:`, currentPlatform.selectors.descriptionPanel);
       return false;
     }
 
-    // Gracefully avoid duplicate injection if a widget already stands inside the block.
     if (targetHasCard(target)) {
-      log("Card already present in target — skipping duplicate injection.", target.selector);
+      log(`[${job.platformName}] Card already present in`, target.selector, "— skipping duplicate injection.");
       return true;
     }
 
@@ -515,30 +736,30 @@
     // Prepend cleanly inside the top of the resolved container.
     target.el.insertBefore(container, target.el.firstChild);
 
-    log("✅ Ghost Risk card injected into", target.selector, { theme, score });
+    log(`✅ [${job.platformName}] Ghost Risk card injected into`, target.selector, { theme, score });
     return true;
   }
 
   function showLoading(job, targetOverride) {
     const theme = detectTheme();
-    ensureStyles(theme);
+    ensureStyles();
     document.getElementById(CARD_ID)?.remove();
     document.querySelectorAll(`[${PROCESSED_ATTR}].gjd-loading`)?.forEach((n) => n.remove());
 
-    const target = targetOverride || findInjectionTarget();
-    if (!target) return; // silently wait; the polling loop will retry.
+    const target = targetOverride || findInjectionTarget(currentPlatform);
+    if (!target) return;
 
     const container = document.createElement("div");
     container.className = "gjd-root";
     container.setAttribute(PROCESSED_ATTR, "true");
     container.innerHTML = `
-      <section id="${CARD_ID}" class="gjd-card gjd-loading" data-theme="${theme}">
+      <section id="${CARD_ID}" class="gjd-card gjd-loading" data-theme="${theme}" data-platform="${job.platform}">
         <div class="gjd-card-header">
           <div class="gjd-brand">
             <span class="gjd-logo gjd-pulse">👻</span>
             <div>
               <div class="gjd-brand-title">Ghost Jobs Detector</div>
-              <div class="gjd-brand-sub">Analyzing posting…</div>
+              <div class="gjd-brand-sub">${job.platformName} · Analyzing posting…</div>
             </div>
           </div>
         </div>
@@ -551,41 +772,46 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Orchestration
+  // Orchestration — unified pipeline across all platforms
   // ---------------------------------------------------------------------------
   async function handleJobViewChange() {
-    if (!isJobViewUrl()) return;
+    const platform = currentPlatform;
+    if (!platform) return;
+    if (!isJobViewUrl(platform)) return;
     if (isInjecting) return;
 
     // Quick early signature check to avoid re-running for the same view.
-    const earlyJob = extractJobData();
-    const earlySig = `${earlyJob.jobId}|${earlyJob.jobTitle}|${earlyJob.descriptionLength}`;
-    if (earlySig === lastJobSignature) return;
+    const earlyJob = extractJobData(platform);
+    if (earlyJob) {
+      const earlySig = `${platform.id}|${earlyJob.jobId}|${earlyJob.jobTitle}|${earlyJob.descriptionLength}`;
+      if (earlySig === lastJobSignature) return;
+    }
 
     isInjecting = true;
 
     try {
       // 1) Wait for job text containers to gracefully appear (poll every 100ms, ≤30 retries).
-      const job = await waitForJobData({ interval: 100, maxRetries: 30 });
-      const signature = `${job.jobId}|${job.jobTitle}|${job.descriptionLength}`;
-      if (signature === lastJobSignature) return; // someone else processed it
+      const job = await waitForJobData(platform, { interval: 100, maxRetries: 30 });
+      if (!job) {
+        isInjecting = false;
+        return;
+      }
+      const signature = `${platform.id}|${job.jobId}|${job.jobTitle}|${job.descriptionLength}`;
+      if (signature === lastJobSignature) return;
       lastJobSignature = signature;
 
-      log("🔎 Job view change detected →", job);
+      log(`🔎 [${platform.name}] Job view change detected →`, job);
 
       // 2) Wait for a valid injection anchor to appear.
-      const target = await waitForInjectionTarget({ timeout: 4000, interval: 150 });
+      const target = await waitForInjectionTarget(platform, { timeout: 4000, interval: 150 });
       if (!target) {
-        warn(
-          "Target container not found after 4s polling. Tried cascade:",
-          SELECTORS.descriptionPanel
-        );
+        warn(`[${platform.name}] Target container not found after 4s polling. Tried cascade:`, platform.selectors.descriptionPanel);
         return;
       }
 
       // 3) Dedup: bail if a card already stands inside the resolved block.
       if (targetHasCard(target)) {
-        log("Card already present in", target.selector, "— skipping.");
+        log(`[${platform.name}] Card already present in`, target.selector, "— skipping.");
         return;
       }
 
@@ -599,20 +825,25 @@
       // 6) Inject the UI card widget element.
       injectCard(job, score, target);
     } catch (err) {
-      warn("handleJobViewChange error:", err);
+      warn(`[${platform?.name}] handleJobViewChange error:`, err);
     } finally {
       isInjecting = false;
     }
   }
 
   function init() {
-    log("🚀 Content script loaded on LinkedIn jobs page.");
+    currentPlatform = detectPlatform();
+    if (!currentPlatform) {
+      log("ℹ️ No supported job platform detected on this page — content script idle.");
+      return;
+    }
+    log(`🚀 [${currentPlatform.name}] Content script loaded.`, { host: location.hostname, url: location.href });
     patchHistoryMethods();
-    attachClickTracking();
+    attachClickTracking(currentPlatform);
 
     // Observe DOM mutations to catch SPA-rendered panels the history hook misses.
     const observer = new MutationObserver(() => {
-      if (isJobViewUrl() && !document.getElementById(CARD_ID)) {
+      if (isJobViewUrl(currentPlatform) && !document.getElementById(CARD_ID)) {
         handleJobViewChange();
       }
     });

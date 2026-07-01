@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Ghost Jobs Detector",
-  "version": "0.1.0",
-  "description": "Visual sandbox extension that detects ghost job listings on LinkedIn using a signature scoring formula (Text DNA, Cross-Platform Sync, Salary Transparency).",
+  "version": "0.2.0",
+  "description": "Universal visual sandbox extension that detects ghost job listings across LinkedIn, Indeed, ZipRecruiter, Glassdoor, JobStreet, and MyCareersFuture using a signature scoring formula (Text DNA, Cross-Platform Sync, Salary Transparency).",
   "author": "Casey",
   "icons": {
     "16": "icons/icon16.png",
@@ -19,13 +19,22 @@
   },
   "permissions": [],
   "host_permissions": [
-    "https://*.linkedin.com/*"
+    "https://*.linkedin.com/jobs/*",
+    "https://*.indeed.com/*",
+    "https://*.ziprecruiter.com/jobs*",
+    "https://*.glassdoor.com/*",
+    "https://*.jobstreet.com.sg/*",
+    "https://*.mycareersfuture.gov.sg/*"
   ],
   "content_scripts": [
     {
       "matches": [
-        "https://www.linkedin.com/jobs/*",
-        "https://linkedin.com/jobs/*"
+        "https://*.linkedin.com/jobs/*",
+        "https://*.indeed.com/*",
+        "https://*.ziprecruiter.com/jobs*",
+        "https://*.glassdoor.com/*",
+        "https://*.jobstreet.com.sg/*",
+        "https://*.mycareersfuture.gov.sg/*"
       ],
       "js": ["content.js"],
       "css": ["styles.css"],
@@ -34,8 +43,15 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["icons/*.png"],
-      "matches": ["https://*.linkedin.com/*"]
+      "resources": ["icons/*.png", "styles.css"],
+      "matches": [
+        "https://*.linkedin.com/*",
+        "https://*.indeed.com/*",
+        "https://*.ziprecruiter.com/*",
+        "https://*.glassdoor.com/*",
+        "https://*.jobstreet.com.sg/*",
+        "https://*.mycareersfuture.gov.sg/*"
+      ]
     }
   ]
 }
